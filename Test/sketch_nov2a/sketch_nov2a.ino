@@ -1,16 +1,18 @@
 /*
-  UNO R4 双 PS2 摇杆 + A/B/X/Y 四按键测试（Minima / WiFi，无需第三方库）
+  UNO R4 双 PS2 摇杆 + A/B/X/Y 四按键 + SSD1306 OLED 状态显示
+  OLED 依赖 Adafruit SSD1306、Adafruit GFX，库管理器安装时同时安装依赖库。
 
   接线：       摇杆 1       摇杆 2
   X / VRx       A2            A3
-  Y / VRy       A1            A4
-  Z / SW        A0            A5
+  Y / VRy       A1            A0
+  Z / SW        D2 (L3)       D3 (R3)
   VCC / +5V     5V            5V
   GND           GND           GND（两个模块与开发板共地）
   Z 是按压开关，不是第三个模拟轴；按下时接地，程序输出 Z=1。
   新增按键：A -> D4，B -> D5，X -> D6，Y -> D7，另一端均接 GND。
   按键逻辑独立放在 Buttons.h / Buttons.cpp，20ms 消抖，支持同时按下。
-  A4/A5 已用于摇杆，本接线不能同时占用它们连接 I2C 设备。
+  OLED：SDA -> A4，SCL -> A5，GND 共地，VCC 按模块额定电压连接。
+  ControllerDisplay.h / .cpp 独立负责显示，默认依次探测 0x3C、0x3D。
 
   使用：选择实际 UNO R4 型号上传，串口监视器设为 115200。
   上电或复位时松开两个摇杆，程序在约 160ms 内自动校准四个轴的中心。
@@ -29,11 +31,16 @@
 */
 
 #include <Arduino.h>
+#include <stdio.h>
+#include <string.h>
 #include "Buttons.h"
+#include "ControllerDisplay.h"
 
 // true：供 VOFA 的 FireWater 协议绘图；false：供串口助手人工阅读。
 // 两种格式互斥，避免带标签的文字混入绘图数据帧。
 const bool VOFA_OUTPUT = true;
+// 死机排查：改为 false 并重新上传，可完全跳过 OLED/I2C 初始化和刷新。
+const bool OLED_ENABLED = true;
 
 // ====================【灵敏度调节】====================
 // 死区：以校准中心为基准，正负两侧各忽略这么多个 ADC 单位。
@@ -85,21 +92,29 @@ struct JoystickState {
 };
 
 const JoystickConfig JOYSTICKS[] = {
-  {A2, A1, A0, J1_DEADZONE, J1_GAIN, J1_INVERT_X, J1_INVERT_Y},
-  {A3, A4, A5, J2_DEADZONE, J2_GAIN, J2_INVERT_X, J2_INVERT_Y}
+  {A2, A1, 2, J1_DEADZONE, J1_GAIN, J1_INVERT_X, J1_INVERT_Y},
+  {A3, A0, 3, J2_DEADZONE, J2_GAIN, J2_INVERT_X, J2_INVERT_Y}
 };
 const size_t JOYSTICK_COUNT = sizeof(JOYSTICKS) / sizeof(JOYSTICKS[0]);
 JoystickState states[JOYSTICK_COUNT] = {};
 unsigned long lastSampleAt = 0;
 unsigned long lastReportAt = 0;
+// 单帧串口缓冲：主循环分块发送，不要求 USB 缓冲区一次装下整行。
+char serialFrame[192];
+size_t serialFrameLength = 0;
+size_t serialFrameOffset = 0;
+unsigned long lastSerialChunkAt = 0;
 
 // 显式声明，确保 Arduino 自动生成函数原型时能识别自定义结构体。
 int processAxis(int raw, int center, int deadzone, float gain, bool invert);
 void sampleJoystick(const JoystickConfig &config, JoystickState &state,
                     unsigned long now);
-void printJoystick(const char *label, const JoystickState &state);
 void printVofaFrame();
+void printTextFrame();
+void sendSerialFrame(const char *frame, int length, size_t capacity);
+void serviceSerialOutput();
 void calibrateCenters();
+void submitDisplayState();
 
 int processAxis(int raw, int center, int deadzone, float gain, bool invert)
 {
@@ -161,46 +176,121 @@ void sampleJoystick(const JoystickConfig &config, JoystickState &state,
   }
 }
 
-void printJoystick(const char *label, const JoystickState &state)
+void sendSerialFrame(const char *frame, int length, size_t capacity)
 {
-  Serial.print(label);
-  Serial.print(" rawX=");
-  Serial.print(state.rawX);
-  Serial.print(" rawY=");
-  Serial.print(state.rawY);
-  Serial.print(" X=");
-  Serial.print(state.x);
-  Serial.print(" Y=");
-  Serial.print(state.y);
-  Serial.print(" Z=");
-  Serial.print(state.pressed ? 1 : 0);
+  // 已开始发送的帧必须先发完，避免两个采样帧拼接成一行。
+  // 尚未发出任何字节时，可以直接替换为最新状态；最多保留一帧。
+  if (length <= 0 || static_cast<size_t>(length) >= capacity ||
+      static_cast<size_t>(length) >= sizeof(serialFrame) ||
+      (serialFrameOffset > 0 && serialFrameOffset < serialFrameLength)) {
+    return;
+  }
+  memcpy(serialFrame, frame, static_cast<size_t>(length));
+  serialFrameLength = static_cast<size_t>(length);
+  serialFrameOffset = 0;
+}
+
+void serviceSerialOutput()
+{
+  // Minima 的 bool 转换还会服务 USB 事件；仅检查一次，不循环等待连接。
+  if (!Serial) {
+    serialFrameLength = 0;
+    serialFrameOffset = 0;
+    return;
+  }
+  if (serialFrameOffset >= serialFrameLength) {
+    return;
+  }
+#if defined(ARDUINO_UNOR4_WIFI) && defined(NO_USB)
+  // WiFi 默认 Serial 是 UART->ESP32 USB 桥，availableForWrite() 未实现，恒为 0。
+  // 不用该值判断能否发送。115200 波特率下每 1ms 最多发 8 字节，
+  // 单次正常发送耗时约 0.7ms，并为上一块的最后一个字节留出发送时间。
+  const unsigned long nowUs = micros();
+  if (nowUs - lastSerialChunkAt < 1000) {
+    return;
+  }
+  lastSerialChunkAt = nowUs;
+  size_t count = serialFrameLength - serialFrameOffset;
+  if (count > 8) {
+    count = 8;
+  }
+  // 选择 UART 的缓冲区重载，避免退化为连续的单字节 write 调用。
+  const size_t sent = Serial.write(
+    reinterpret_cast<uint8_t *>(serialFrame + serialFrameOffset), count);
+#else
+  const int space = Serial.availableForWrite();
+  if (space <= 0) {
+    return;
+  }
+  size_t count = serialFrameLength - serialFrameOffset;
+  if (count > 32) {
+    count = 32;
+  }
+  if (count > static_cast<size_t>(space)) {
+    count = static_cast<size_t>(space);
+  }
+  const size_t sent = Serial.write(
+    reinterpret_cast<const uint8_t *>(serialFrame + serialFrameOffset), count);
+#endif
+  serialFrameOffset += sent;
+  if (serialFrameOffset >= serialFrameLength) {
+    serialFrameLength = 0;
+    serialFrameOffset = 0;
+  }
 }
 
 void printVofaFrame()
 {
-  // 一个采样帧包含两个摇杆的全部数据，通道顺序固定。
-  const int channels[] = {
+  // 先在内存中生成完整 14 通道帧，避免多次 print 在帧中间阻塞。
+  char frame[192];
+  const int length = snprintf(frame, sizeof(frame),
+    "joystick:%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\r\n",
     states[0].x, states[0].y, states[1].x, states[1].y,
     states[0].pressed ? 1 : 0, states[1].pressed ? 1 : 0,
     states[0].rawX, states[0].rawY, states[1].rawX, states[1].rawY,
     Buttons::isPressed(Buttons::A) ? 1 : 0,
     Buttons::isPressed(Buttons::B) ? 1 : 0,
     Buttons::isPressed(Buttons::X) ? 1 : 0,
-    Buttons::isPressed(Buttons::Y) ? 1 : 0
+    Buttons::isPressed(Buttons::Y) ? 1 : 0);
+  sendSerialFrame(frame, length, sizeof(frame));
+}
+
+void printTextFrame()
+{
+  char frame[192];
+  const int length = snprintf(frame, sizeof(frame),
+    "J1 rawX=%d rawY=%d X=%d Y=%d Z=%d | "
+    "J2 rawX=%d rawY=%d X=%d Y=%d Z=%d | A=%d B=%d X=%d Y=%d\r\n",
+    states[0].rawX, states[0].rawY, states[0].x, states[0].y,
+    states[0].pressed ? 1 : 0,
+    states[1].rawX, states[1].rawY, states[1].x, states[1].y,
+    states[1].pressed ? 1 : 0,
+    Buttons::isPressed(Buttons::A) ? 1 : 0,
+    Buttons::isPressed(Buttons::B) ? 1 : 0,
+    Buttons::isPressed(Buttons::X) ? 1 : 0,
+    Buttons::isPressed(Buttons::Y) ? 1 : 0);
+  sendSerialFrame(frame, length, sizeof(frame));
+}
+
+void submitDisplayState()
+{
+  const ControllerDisplay::Snapshot snapshot = {
+    states[0].x, states[0].y, states[1].x, states[1].y,
+    states[0].pressed, states[1].pressed,
+    Buttons::isPressed(Buttons::A), Buttons::isPressed(Buttons::B),
+    Buttons::isPressed(Buttons::X), Buttons::isPressed(Buttons::Y)
   };
-  Serial.print("joystick:");
-  for (size_t i = 0; i < sizeof(channels) / sizeof(channels[0]); ++i) {
-    if (i > 0) {
-      Serial.print(',');
-    }
-    Serial.print(channels[i]);
-  }
-  Serial.println();  // FireWater 必须以换行结束一帧。
+  ControllerDisplay::submit(snapshot);
 }
 
 void setup()
 {
   Serial.begin(115200);
+#if !defined(NO_USB)
+  // 仅原生 USB 目标：允许未拉高 DTR 的串口助手接收数据。
+  (void)Serial.dtr();
+#endif
+  // 不使用 while(!Serial)，不开串口也能操作手柄与 OLED。
   // 不等待串口连接，保证未打开监视器时程序也能正常采集。
   analogReadResolution(10);
   for (size_t i = 0; i < JOYSTICK_COUNT; ++i) {
@@ -210,6 +300,10 @@ void setup()
   }
 
   calibrateCenters();
+  // OLED 不存在或初始化失败时不阻塞等待，不向 FireWater 数据插入提示文字。
+  if (OLED_ENABLED) {
+    ControllerDisplay::begin();
+  }
   Buttons::begin();
   const unsigned long now = millis();
   for (size_t i = 0; i < JOYSTICK_COUNT; ++i) {
@@ -217,6 +311,7 @@ void setup()
   }
   lastSampleAt = now;
   lastReportAt = now;
+  submitDisplayState();
 }
 
 void loop()
@@ -229,6 +324,7 @@ void loop()
       sampleJoystick(JOYSTICKS[i], states[i], now);
     }
     Buttons::update(now);
+    submitDisplayState();
   }
 
   if (now - lastReportAt >= REPORT_INTERVAL_MS) {
@@ -236,18 +332,11 @@ void loop()
     if (VOFA_OUTPUT) {
       printVofaFrame();
     } else {
-      printJoystick("J1", states[0]);
-      Serial.print(" | ");
-      printJoystick("J2", states[1]);
-      Serial.print(" | A=");
-      Serial.print(Buttons::isPressed(Buttons::A) ? 1 : 0);
-      Serial.print(" B=");
-      Serial.print(Buttons::isPressed(Buttons::B) ? 1 : 0);
-      Serial.print(" X=");
-      Serial.print(Buttons::isPressed(Buttons::X) ? 1 : 0);
-      Serial.print(" Y=");
-      Serial.print(Buttons::isPressed(Buttons::Y) ? 1 : 0);
-      Serial.println();
+      printTextFrame();
     }
+  }
+  serviceSerialOutput();
+  if (OLED_ENABLED) {
+    ControllerDisplay::update(millis());
   }
 }
