@@ -3,14 +3,14 @@
 
   接线：       摇杆 1       摇杆 2
   X / VRx       A2            A3
-  Y / VRy       A1            A4
-  Z / SW        A0            A5
+  Y / VRy       A1            A0
+  SW（L3/R3）   D2            D3
   VCC / +5V     5V            5V
   GND           GND           GND（两个模块与开发板共地）
-  Z 是按压开关，不是第三个模拟轴；按下时接地，程序输出 Z=1。
+  SW 是按压开关，不是第三个模拟轴；按下时接地，程序输出 SW=1。
   新增按键：A -> D4，B -> D5，X -> D6，Y -> D7，另一端均接 GND。
-  按键逻辑独立放在 Buttons.h / Buttons.cpp，20ms 消抖，支持同时按下。
-  A4/A5 已用于摇杆，本接线不能同时占用它们连接 I2C 设备。
+  六个按键统一由 Buttons.h / Buttons.cpp 处理，20ms 消抖，支持同时按下。
+  A4/SDA、A5/SCL 预留给 I2C OLED；当前尚未添加屏幕驱动和显示逻辑。
 
   使用：选择实际 UNO R4 型号上传，串口监视器设为 115200。
   上电或复位时松开两个摇杆，程序在约 160ms 内自动校准四个轴的中心。
@@ -20,7 +20,7 @@
   默认输出 VOFA FireWater 数据：joystick:0,0,0,0,0,1,512,510,509,513,0,0,0,0
   VOFA 中选择串口和 FireWater 协议，添加波形图并绑定 Y 轴通道。
   通道 0～3：J1 X、J1 Y、J2 X、J2 Y（-1000～1000）。
-  通道 4～5：J1 Z、J2 Z（按下为 1，松开为 0）。
+  通道 4～5：J1 SW（L3）、J2 SW（R3）（按下为 1，松开为 0）。
   通道 6～9：J1 rawX、J1 rawY、J2 rawX、J2 rawY（0～1023）。
   通道 10～13：A、B、X、Y 四个按键（按下为 1，松开为 0）。
   VOFA_OUTPUT 改为 false 可恢复原来的 J1/J2 带标签文字输出。
@@ -59,13 +59,12 @@ const int ADC_MAX = 1023;
 const int AXIS_MAX = 1000;
 const unsigned long SAMPLE_INTERVAL_MS = 5;
 const unsigned long REPORT_INTERVAL_MS = 50;
-const unsigned long DEBOUNCE_MS = 20;
 const int CALIBRATION_SAMPLES = 32;
 
 struct JoystickConfig {
   int xPin;
   int yPin;
-  int buttonPin;
+  Buttons::Id swButton;
   int deadzone;
   float gain;
   bool invertX;
@@ -79,14 +78,11 @@ struct JoystickState {
   int rawY;
   int x;
   int y;
-  bool buttonCandidate;
-  bool pressed;
-  unsigned long buttonChangedAt;
 };
 
 const JoystickConfig JOYSTICKS[] = {
-  {A2, A1, A0, J1_DEADZONE, J1_GAIN, J1_INVERT_X, J1_INVERT_Y},
-  {A3, A4, A5, J2_DEADZONE, J2_GAIN, J2_INVERT_X, J2_INVERT_Y}
+  {A2, A1, Buttons::L3, J1_DEADZONE, J1_GAIN, J1_INVERT_X, J1_INVERT_Y},
+  {A3, A0, Buttons::R3, J2_DEADZONE, J2_GAIN, J2_INVERT_X, J2_INVERT_Y}
 };
 const size_t JOYSTICK_COUNT = sizeof(JOYSTICKS) / sizeof(JOYSTICKS[0]);
 JoystickState states[JOYSTICK_COUNT] = {};
@@ -95,9 +91,9 @@ unsigned long lastReportAt = 0;
 
 // 显式声明，确保 Arduino 自动生成函数原型时能识别自定义结构体。
 int processAxis(int raw, int center, int deadzone, float gain, bool invert);
-void sampleJoystick(const JoystickConfig &config, JoystickState &state,
-                    unsigned long now);
-void printJoystick(const char *label, const JoystickState &state);
+void sampleJoystick(const JoystickConfig &config, JoystickState &state);
+void printJoystick(const char *label, const JoystickConfig &config,
+                   const JoystickState &state);
 void printVofaFrame();
 void calibrateCenters();
 
@@ -140,8 +136,7 @@ void calibrateCenters()
   }
 }
 
-void sampleJoystick(const JoystickConfig &config, JoystickState &state,
-                    unsigned long now)
+void sampleJoystick(const JoystickConfig &config, JoystickState &state)
 {
   state.rawX = analogRead(config.xPin);
   state.rawY = analogRead(config.yPin);
@@ -149,19 +144,10 @@ void sampleJoystick(const JoystickConfig &config, JoystickState &state,
                         config.gain, config.invertX);
   state.y = processAxis(state.rawY, state.centerY, config.deadzone,
                         config.gain, config.invertY);
-
-  // 两个按钮各自消抖，不阻塞轴采集，也不抢占摇杆方向输入。
-  const bool reading = digitalRead(config.buttonPin) == LOW;
-  if (reading != state.buttonCandidate) {
-    state.buttonCandidate = reading;
-    state.buttonChangedAt = now;
-  }
-  if (now - state.buttonChangedAt >= DEBOUNCE_MS) {
-    state.pressed = state.buttonCandidate;
-  }
 }
 
-void printJoystick(const char *label, const JoystickState &state)
+void printJoystick(const char *label, const JoystickConfig &config,
+                   const JoystickState &state)
 {
   Serial.print(label);
   Serial.print(" rawX=");
@@ -172,8 +158,8 @@ void printJoystick(const char *label, const JoystickState &state)
   Serial.print(state.x);
   Serial.print(" Y=");
   Serial.print(state.y);
-  Serial.print(" Z=");
-  Serial.print(state.pressed ? 1 : 0);
+  Serial.print(" SW=");
+  Serial.print(Buttons::isPressed(config.swButton) ? 1 : 0);
 }
 
 void printVofaFrame()
@@ -181,7 +167,8 @@ void printVofaFrame()
   // 一个采样帧包含两个摇杆的全部数据，通道顺序固定。
   const int channels[] = {
     states[0].x, states[0].y, states[1].x, states[1].y,
-    states[0].pressed ? 1 : 0, states[1].pressed ? 1 : 0,
+    Buttons::isPressed(JOYSTICKS[0].swButton) ? 1 : 0,
+    Buttons::isPressed(JOYSTICKS[1].swButton) ? 1 : 0,
     states[0].rawX, states[0].rawY, states[1].rawX, states[1].rawY,
     Buttons::isPressed(Buttons::A) ? 1 : 0,
     Buttons::isPressed(Buttons::B) ? 1 : 0,
@@ -206,14 +193,15 @@ void setup()
   for (size_t i = 0; i < JOYSTICK_COUNT; ++i) {
     pinMode(JOYSTICKS[i].xPin, INPUT);
     pinMode(JOYSTICKS[i].yPin, INPUT);
-    pinMode(JOYSTICKS[i].buttonPin, INPUT_PULLUP);
   }
 
-  calibrateCenters();
+  // A/B/X/Y、L3、R3 各自独立消抖，SW 引脚作为数字输入使用。
   Buttons::begin();
+  calibrateCenters();
   const unsigned long now = millis();
+  Buttons::update(now);
   for (size_t i = 0; i < JOYSTICK_COUNT; ++i) {
-    sampleJoystick(JOYSTICKS[i], states[i], now);
+    sampleJoystick(JOYSTICKS[i], states[i]);
   }
   lastSampleAt = now;
   lastReportAt = now;
@@ -226,7 +214,7 @@ void loop()
   if (now - lastSampleAt >= SAMPLE_INTERVAL_MS) {
     lastSampleAt = now;
     for (size_t i = 0; i < JOYSTICK_COUNT; ++i) {
-      sampleJoystick(JOYSTICKS[i], states[i], now);
+      sampleJoystick(JOYSTICKS[i], states[i]);
     }
     Buttons::update(now);
   }
@@ -236,9 +224,9 @@ void loop()
     if (VOFA_OUTPUT) {
       printVofaFrame();
     } else {
-      printJoystick("J1", states[0]);
+      printJoystick("J1", JOYSTICKS[0], states[0]);
       Serial.print(" | ");
-      printJoystick("J2", states[1]);
+      printJoystick("J2", JOYSTICKS[1], states[1]);
       Serial.print(" | A=");
       Serial.print(Buttons::isPressed(Buttons::A) ? 1 : 0);
       Serial.print(" B=");
