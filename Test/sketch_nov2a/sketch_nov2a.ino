@@ -13,18 +13,20 @@
   按键逻辑独立放在 Buttons.h / Buttons.cpp，20ms 消抖，支持同时按下。
   OLED：SDA -> A4，SCL -> A5，GND 共地，VCC 按模块额定电压连接。
   ControllerDisplay.h / .cpp 独立负责显示，默认依次探测 0x3C、0x3D。
+  HC-SR04：VCC -> 5V，GND 共地，Trig -> D9，Echo -> D8（外部中断）。
 
   使用：选择实际 UNO R4 型号上传，串口监视器设为 115200。
   上电或复位时松开两个摇杆，程序在约 160ms 内自动校准四个轴的中心。
   如校准时碰动摇杆，请松手后按开发板 RESET 重新校准。
   rawX/rawY 是 0～1023 原始值；X/Y 是 -1000～1000 处理值。
   默认原始值增大为正方向，实际左右/上下方向取决于模块安装方向。
-  默认输出 VOFA FireWater 数据：joystick:0,0,0,0,0,1,512,510,509,513,0,0,0,0
+  默认输出 VOFA FireWater 数据：joystick:0,0,0,0,0,1,512,510,509,513,0,0,0,0,-1,0
   VOFA 中选择串口和 FireWater 协议，添加波形图并绑定 Y 轴通道。
   通道 0～3：J1 X、J1 Y、J2 X、J2 Y（-1000～1000）。
   通道 4～5：J1 Z、J2 Z（按下为 1，松开为 0）。
   通道 6～9：J1 rawX、J1 rawY、J2 rawX、J2 rawY（0～1023）。
   通道 10～13：A、B、X、Y 四个按键（按下为 1，松开为 0）。
+  通道 14～15：超声波距离（cm，无效 -1）、刹车状态（0/1）。
   VOFA_OUTPUT 改为 false 可恢复原来的 J1/J2 带标签文字输出。
   本程序仅采集并输出串口数据，后续可再接入电脑端手柄映射。
 
@@ -35,6 +37,7 @@
 #include <string.h>
 #include "Buttons.h"
 #include "ControllerDisplay.h"
+#include "Ultrasonic.h"
 
 // true：供 VOFA 的 FireWater 协议绘图；false：供串口助手人工阅读。
 // 两种格式互斥，避免带标签的文字混入绘图数据帧。
@@ -100,7 +103,7 @@ JoystickState states[JOYSTICK_COUNT] = {};
 unsigned long lastSampleAt = 0;
 unsigned long lastReportAt = 0;
 // 单帧串口缓冲：主循环分块发送，不要求 USB 缓冲区一次装下整行。
-char serialFrame[192];
+char serialFrame[256];
 size_t serialFrameLength = 0;
 size_t serialFrameOffset = 0;
 unsigned long lastSerialChunkAt = 0;
@@ -241,26 +244,27 @@ void serviceSerialOutput()
 
 void printVofaFrame()
 {
-  // 先在内存中生成完整 14 通道帧，避免多次 print 在帧中间阻塞。
-  char frame[192];
+  // 原 14 通道顺序不变，追加距离和刹车状态。
+  char frame[256];
   const int length = snprintf(frame, sizeof(frame),
-    "joystick:%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\r\n",
+    "joystick:%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\r\n",
     states[0].x, states[0].y, states[1].x, states[1].y,
     states[0].pressed ? 1 : 0, states[1].pressed ? 1 : 0,
     states[0].rawX, states[0].rawY, states[1].rawX, states[1].rawY,
     Buttons::isPressed(Buttons::A) ? 1 : 0,
     Buttons::isPressed(Buttons::B) ? 1 : 0,
     Buttons::isPressed(Buttons::X) ? 1 : 0,
-    Buttons::isPressed(Buttons::Y) ? 1 : 0);
+    Buttons::isPressed(Buttons::Y) ? 1 : 0,
+    Ultrasonic::distanceCm(), Ultrasonic::brakePressed() ? 1 : 0);
   sendSerialFrame(frame, length, sizeof(frame));
 }
 
 void printTextFrame()
 {
-  char frame[192];
+  char frame[256];
   const int length = snprintf(frame, sizeof(frame),
     "J1 rawX=%d rawY=%d X=%d Y=%d Z=%d | "
-    "J2 rawX=%d rawY=%d X=%d Y=%d Z=%d | A=%d B=%d X=%d Y=%d\r\n",
+    "J2 rawX=%d rawY=%d X=%d Y=%d Z=%d | A=%d B=%d X=%d Y=%d | DistanceCm=%d Brake=%d\r\n",
     states[0].rawX, states[0].rawY, states[0].x, states[0].y,
     states[0].pressed ? 1 : 0,
     states[1].rawX, states[1].rawY, states[1].x, states[1].y,
@@ -268,7 +272,8 @@ void printTextFrame()
     Buttons::isPressed(Buttons::A) ? 1 : 0,
     Buttons::isPressed(Buttons::B) ? 1 : 0,
     Buttons::isPressed(Buttons::X) ? 1 : 0,
-    Buttons::isPressed(Buttons::Y) ? 1 : 0);
+    Buttons::isPressed(Buttons::Y) ? 1 : 0,
+    Ultrasonic::distanceCm(), Ultrasonic::brakePressed() ? 1 : 0);
   sendSerialFrame(frame, length, sizeof(frame));
 }
 
@@ -305,6 +310,7 @@ void setup()
     ControllerDisplay::begin();
   }
   Buttons::begin();
+  Ultrasonic::begin();
   const unsigned long now = millis();
   for (size_t i = 0; i < JOYSTICK_COUNT; ++i) {
     sampleJoystick(JOYSTICKS[i], states[i], now);
@@ -316,6 +322,7 @@ void setup()
 
 void loop()
 {
+  Ultrasonic::update();
   const unsigned long now = millis();
   // 无符号时间差也能正确处理 millis() 计数回绕。
   if (now - lastSampleAt >= SAMPLE_INTERVAL_MS) {
