@@ -12,9 +12,11 @@ UNO R4 双 PS2 摇杆、A/B/X/Y 四个按键与 SSD1306 128×64 I²C OLED 状态
 
 当前安装包本身未签名，Windows 可能显示“未知发布者”或 SmartScreen 提示。随包的 ViGEmBus 驱动安装器有官方签名。
 
+按键映射和故障排查见[虚拟手柄使用说明](windows_gamepad/虚拟手柄使用说明.md)。Windows 桌面程序的源码、源码运行方法和打包脚本见 [windows_gamepad](windows_gamepad/)。
+
 ## 固件文件
 
-所有代码位于 `Test/sketch_nov2a/`：
+Arduino 固件代码位于 `Test/sketch_nov2a/`：
 
 - `sketch_nov2a.ino`：主程序、双摇杆采集、中心校准、灵敏度和串口输出。
 - `Buttons.h`：四按键接口。
