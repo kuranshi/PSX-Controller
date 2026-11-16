@@ -1,8 +1,18 @@
 # PSX Controller
 
-UNO R4 双 PS2 摇杆、A/B/X/Y 四个按键与 SSD1306 128×64 I²C OLED 状态显示。当前通过串口和 OLED 验证输入，尚未实现电脑 USB 游戏手柄映射。
+UNO R4 双 PS2 摇杆、A/B/X/Y 四个按键与 SSD1306 128×64 I²C OLED 状态显示。Windows 桌面程序通过 USB 串口读取 Arduino 输入，把左右摇杆和 A/B/X/Y 映射为虚拟 Xbox 360 手柄。
 
-## 程序文件
+## Windows 一键安装
+
+当前分支包含 [PSX Controller 0.1.0 安装包（Windows x64）](windows_gamepad/dist/installer/PSX-Controller-Setup-0.1.0-x64.exe)。只需复制这一个文件到目标电脑，双击运行。安装包包含桌面程序、运行所需的 Python 组件和 ViGEmBus 驱动安装器。安装需要管理员权限，驱动安装完成后若提示重启，请先重启。
+
+1. 用 USB 数据线连接已烧录本项目固件的 Arduino，关掉 VOFA 和 Arduino 串口监视器，释放串口。
+2. 从开始菜单打开 **PSX Controller**，确认选中 Arduino 对应的 COM 口，再点 **连接手柄**。列表里找不到时，点 **刷新**。
+3. 保持程序运行，按 `Win + R`，输入 `joy.cpl`，打开 Xbox 360 控制器的 **属性 → 测试**。推动左右摇杆并按下 A/B/X/Y，确认 Windows 收到输入。
+
+当前安装包本身未签名，Windows 可能显示“未知发布者”或 SmartScreen 提示。随包的 ViGEmBus 驱动安装器有官方签名。
+
+## 固件文件
 
 所有代码位于 `Test/sketch_nov2a/`：
 
