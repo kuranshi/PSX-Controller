@@ -1,6 +1,12 @@
 # PSX Controller
 
-UNO R4 双 PS2 摇杆、A/B/X/Y 四个按键与 SSD1306 128×64 I²C OLED 状态显示。当前通过串口和 OLED 验证输入，尚未实现电脑 USB 游戏手柄映射。
+UNO R4 双 PS2 摇杆、A/B/X/Y 四个按键与 SSD1306 128×64 I²C OLED 状态显示。Windows 端提供桌面桥接程序，可把摇杆和 A/B/X/Y 映射为虚拟 Xbox 360 手柄。
+
+## Windows 虚拟手柄
+
+到 [Releases](https://github.com/kuranshi/PSX-Controller/releases) 下载 `PSX-Controller-Setup-...-x64.exe`，运行安装程序并按提示安装虚拟手柄驱动。安装驱动后如 Windows 要求重启，请重启电脑。连接 Arduino 后打开“PSX Controller”，选择对应 COM 口并连接；再运行 `joy.cpl` 可以检查摇杆和按键输入。使用前需关闭 VOFA、串口监视器等占用该 COM 口的软件。
+
+详细步骤、映射关系和故障排查见 [`windows_gamepad/虚拟手柄使用说明.md`](windows_gamepad/虚拟手柄使用说明.md)。虚拟手柄目前依赖 ViGEmBus 1.22.0；该驱动项目已停止维护，详情与许可见安装目录中的第三方声明。
 
 ## 程序文件
 
